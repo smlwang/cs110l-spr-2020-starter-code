@@ -10,6 +10,10 @@ fn main() {
 }
 ```
 
+s = String::from("goodbye");
+if next line not exist, this would be ok. 
+When excute assign operation, the old value that referenced would be released,
+then ref3 will point to a null value, so this code will not be compiled.
 
 
 Example 2:
@@ -19,8 +23,10 @@ fn drip_drop() -> &String {
     return &s;
 }
 ```
-
-
+This function try to return a referenced type,
+when function end, rust will release variable s,
+but rust see that we try to expand the lifetime of variable s,
+which cause confusion that we don't know when the variable can be released unless the lifetime of it be specied by static.
 
 Example 3:
 ```
@@ -32,3 +38,8 @@ fn main() {
     println!("{}", s2);
 }
 ```
+let s2: String = v[0];
+Any assignment operation on Vec type is a copy operation, but the String not implement it,
+but this code can be accepted by compiler:
+let s2: String = v[0].clone()
+because v[0].clone() afford a copy of v[0], so this is a brand new value.
