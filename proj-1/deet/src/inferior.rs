@@ -1,8 +1,65 @@
+use addr2line::gimli::LineInstruction;
 use nix::sys::ptrace;
 use nix::sys::signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::process::Child;
+use std::collections::HashMap;
+use std::process::{Child, Command};
+use std::os::unix::process::CommandExt;
+use crate::dwarf_data::{DwarfData};
+use std::mem::size_of;
+
+fn align_addr_to_word(addr: usize) -> usize {
+    addr & (-(size_of::<usize>() as isize) as usize)
+}
+#[derive(Clone)]
+pub struct Breakpoint {
+    addr: usize,
+    orig_byte: u8,
+}
+impl Inferior {
+    fn write_byte(&mut self, addr: usize, val: u8) -> Result<u8, nix::Error> {
+        let aligned_addr = align_addr_to_word(addr);
+        let byte_offset = addr - aligned_addr;
+        let word = ptrace::read(self.pid(), aligned_addr as ptrace::AddressType)? as u64;
+        let orig_byte = (word >> 8 * byte_offset) & 0xff;
+        let masked_word = word & !(0xff << 8 * byte_offset);
+        let updated_word = masked_word | ((val as u64) << 8 * byte_offset);
+        ptrace::write(
+            self.pid(),
+            aligned_addr as ptrace::AddressType,
+            updated_word as *mut std::ffi::c_void,
+        )?;
+        Ok(orig_byte as u8)
+    }
+    pub fn set_breakpoint(&mut self, addr: &usize) -> Result<(), nix::Error> {
+        let orig_byte = self.write_byte(*addr, 0xcc)?;
+        self.breakpoint_map.insert(*addr, Breakpoint { addr: *addr, orig_byte });
+        Ok(())
+    }
+    pub fn set_breakpoint_t(&mut self, addr: &usize) -> Result<(), nix::Error> {
+        let _ = self.write_byte(*addr, 0xcc)?;
+        Ok(())
+    }
+    pub fn ptrace_step(&mut self) -> Result<(), nix::Error> {
+        ptrace::step(self.pid(), None)
+    }
+    pub fn get_breakpoint(&mut self, addr: &usize) -> Option<Breakpoint> {
+        Some(self.breakpoint_map.get(addr)?.clone())
+    }
+    pub fn unset_breakpoint_t(&mut self, addr: &usize) -> Result<(), nix::Error>{
+        if let Some((_, breakpoint)) = self.breakpoint_map.get_key_value(&addr) {
+            let _ = self.write_byte(breakpoint.addr, breakpoint.orig_byte)?;
+        }
+        Ok(())
+    }
+    pub fn unset_breakpoint(&mut self, addr: &usize) -> Result<(), nix::Error>{
+        if let Some((_, breakpoint)) = self.breakpoint_map.remove_entry(&addr) {
+            let _ = self.write_byte(breakpoint.addr, breakpoint.orig_byte)?;
+        }
+        Ok(())
+    }
+}
 
 pub enum Status {
     /// Indicates inferior stopped. Contains the signal that stopped the process, as well as the
@@ -28,18 +85,65 @@ fn child_traceme() -> Result<(), std::io::Error> {
 
 pub struct Inferior {
     child: Child,
+    breakpoint_map: HashMap<usize, Breakpoint>,
 }
 
 impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
-    pub fn new(target: &str, args: &Vec<String>) -> Option<Inferior> {
-        // TODO: implement me!
-        println!(
-            "Inferior::new not implemented! target={}, args={:?}",
-            target, args
-        );
-        None
+    pub fn new(target: &str, args: &Vec<String>, breakpoints: &Vec<usize>) -> Option<Inferior> {
+        let mut cmd = Command::new(target);
+        cmd.args(args);
+        unsafe {
+            cmd.pre_exec(child_traceme);
+        }
+
+        let child = Inferior{child: cmd.spawn().ok()?, breakpoint_map: HashMap::new()};
+
+        let mut inferior = match child.wait(None).ok()? {
+            Status::Stopped(signal::SIGTRAP, _) => child,
+            _ => return None,
+        };
+        for addr in breakpoints {
+            inferior.set_breakpoint(addr).ok()?;
+        }
+        Some(inferior)
+    }
+    pub fn get_regs(&self) -> Option<libc::user_regs_struct> {
+        Some(ptrace::getregs(self.pid()).ok()?)
+    }
+    pub fn print_backtrace(&self, debug_data: &DwarfData) -> Result<(), nix::Error> {
+        let regs= ptrace::getregs(self.pid())?;
+        let mut instruction_ptr = regs.rip as usize;
+        let mut base_ptr = regs.rbp as usize;
+        loop {
+            let func = debug_data.get_function_from_addr(instruction_ptr);
+            let line = debug_data.get_line_from_addr(instruction_ptr);
+            match (func, line) {
+                (Some(func_name), Some(line_info)) => {
+                    println!("{} ({})", func_name, line_info);
+                    if func_name == "main" {
+                        break;
+                    }
+                }
+                _ => {
+                    println!("unknown func (unknown position)");
+                    break;
+                }
+            }
+            instruction_ptr = ptrace::read(self.pid(), (base_ptr + 8) as ptrace::AddressType)? as usize;
+            base_ptr = ptrace::read(self.pid(), base_ptr as ptrace::AddressType)? as usize;
+        }
+        Ok(())
+    }
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        println!("Killing running inferior (pid {})", self.pid());
+        self.child.kill()
+    }
+    
+    pub fn resume(&mut self) -> Result<Status, nix::Error> {
+        ptrace::cont(self.pid(), None)?;
+        self.wait(None)
     }
 
     /// Returns the pid of this inferior.
