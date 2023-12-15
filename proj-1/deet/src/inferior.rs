@@ -3,22 +3,17 @@ use nix::sys::ptrace;
 use nix::sys::signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::collections::HashMap;
 use std::process::{Child, Command};
 use std::os::unix::process::CommandExt;
+use crate::breakpoint_manager::BreakpointManager;
 use crate::dwarf_data::{DwarfData};
 use std::mem::size_of;
 
 fn align_addr_to_word(addr: usize) -> usize {
     addr & (-(size_of::<usize>() as isize) as usize)
 }
-#[derive(Clone)]
-pub struct Breakpoint {
-    addr: usize,
-    orig_byte: u8,
-}
 impl Inferior {
-    fn write_byte(&mut self, addr: usize, val: u8) -> Result<u8, nix::Error> {
+    pub fn write_byte(&mut self, addr: usize, val: u8) -> Result<u8, nix::Error> {
         let aligned_addr = align_addr_to_word(addr);
         let byte_offset = addr - aligned_addr;
         let word = ptrace::read(self.pid(), aligned_addr as ptrace::AddressType)? as u64;
@@ -32,32 +27,8 @@ impl Inferior {
         )?;
         Ok(orig_byte as u8)
     }
-    pub fn set_breakpoint(&mut self, addr: &usize) -> Result<(), nix::Error> {
-        let orig_byte = self.write_byte(*addr, 0xcc)?;
-        self.breakpoint_map.insert(*addr, Breakpoint { addr: *addr, orig_byte });
-        Ok(())
-    }
-    pub fn set_breakpoint_t(&mut self, addr: &usize) -> Result<(), nix::Error> {
-        let _ = self.write_byte(*addr, 0xcc)?;
-        Ok(())
-    }
     pub fn ptrace_step(&mut self) -> Result<(), nix::Error> {
         ptrace::step(self.pid(), None)
-    }
-    pub fn get_breakpoint(&mut self, addr: &usize) -> Option<Breakpoint> {
-        Some(self.breakpoint_map.get(addr)?.clone())
-    }
-    pub fn unset_breakpoint_t(&mut self, addr: &usize) -> Result<(), nix::Error>{
-        if let Some((_, breakpoint)) = self.breakpoint_map.get_key_value(&addr) {
-            let _ = self.write_byte(breakpoint.addr, breakpoint.orig_byte)?;
-        }
-        Ok(())
-    }
-    pub fn unset_breakpoint(&mut self, addr: &usize) -> Result<(), nix::Error>{
-        if let Some((_, breakpoint)) = self.breakpoint_map.remove_entry(&addr) {
-            let _ = self.write_byte(breakpoint.addr, breakpoint.orig_byte)?;
-        }
-        Ok(())
     }
 }
 
@@ -85,28 +56,25 @@ fn child_traceme() -> Result<(), std::io::Error> {
 
 pub struct Inferior {
     child: Child,
-    breakpoint_map: HashMap<usize, Breakpoint>,
 }
 
 impl Inferior {
     /// Attempts to start a new inferior process. Returns Some(Inferior) if successful, or None if
     /// an error is encountered.
-    pub fn new(target: &str, args: &Vec<String>, breakpoints: &Vec<usize>) -> Option<Inferior> {
+    pub fn new(target: &str, args: &Vec<String>, breakpoints: &mut BreakpointManager) -> Option<Inferior> {
         let mut cmd = Command::new(target);
         cmd.args(args);
         unsafe {
             cmd.pre_exec(child_traceme);
         }
 
-        let child = Inferior{child: cmd.spawn().ok()?, breakpoint_map: HashMap::new()};
-
-        let mut inferior = match child.wait(None).ok()? {
+        let mut child = Inferior{child: cmd.spawn().ok()?};
+        breakpoints.init_breakpoint(&mut child).ok()?;
+        let inferior = match child.wait(None).ok()? {
             Status::Stopped(signal::SIGTRAP, _) => child,
             _ => return None,
         };
-        for addr in breakpoints {
-            inferior.set_breakpoint(addr).ok()?;
-        }
+        
         Some(inferior)
     }
     pub fn get_regs(&self) -> Option<libc::user_regs_struct> {

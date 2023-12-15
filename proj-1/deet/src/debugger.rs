@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use crate::breakpoint_manager::{self, BreakpointManager, BreakpointArgType};
 use crate::debugger_command::DebuggerCommand;
 use crate::inferior::{Inferior,Status, self};
 use nix::{sys::signal};
@@ -5,39 +8,14 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use crate::dwarf_data::{DwarfData, Error as DwarfError, Line};
 
+
 pub struct Debugger {
     target: String,
     history_path: String,
     readline: Editor<()>,
     inferior: Option<Inferior>,
     debug_data: DwarfData,
-    breakpoints: Vec<usize>,
-    
-}
-enum BreakpointArgType {
-    Line(usize),
-    FuncName(String),
-    Addr(usize),
-    Unknown,
-}
-fn parse_breakpoint_arg(raw_addr: &str) -> BreakpointArgType {
-    if raw_addr.to_lowercase().starts_with('*') {
-        let raw_addr_without_0x = if raw_addr.to_lowercase().starts_with("0x") {
-            &raw_addr[2..]
-        } else {
-            &raw_addr
-        };
-        return match usize::from_str_radix(raw_addr_without_0x, 16).ok() {
-            Some(addr) =>  {
-                BreakpointArgType::Addr(addr)
-            }
-            None => BreakpointArgType::Unknown
-        }
-    } 
-    if let Some(line) = usize::from_str_radix(raw_addr, 10).ok() {
-        return BreakpointArgType::Line(line);
-    }
-    BreakpointArgType::FuncName(raw_addr.to_string())
+    breakpoints: BreakpointManager,
 }
 enum StepStatus {
     Exit,
@@ -69,11 +47,11 @@ impl Debugger {
             readline,
             inferior: None,
             debug_data,
-            breakpoints: vec![],
+            breakpoints: BreakpointManager::new(),
         }
     }
     fn parse_address(&mut self, raw_addr: &str) -> Option<usize> {
-        match parse_breakpoint_arg(raw_addr) {
+        match BreakpointManager::parse_breakpoint_arg(raw_addr) {
             BreakpointArgType::Line(line) => {
                 println!("Function get_addr_for_line dosen't work.");
                 self.debug_data.get_addr_for_line(None, line)
@@ -91,11 +69,8 @@ impl Debugger {
         match self.inferior.as_mut().unwrap().resume().unwrap() {
             Status::Stopped(s, rip) => {
                 println!("Child stopped (signal {})", s);
-                if let Some(line) = DwarfData::get_line_from_addr(&self.debug_data, rip) {
-                    println!("Stopped at {}", line);
-                } else {
-                    println!("Stopped at ???");
-                }
+                let line = DwarfData::get_line_from_addr(&self.debug_data, rip);
+                Self::print_stop_line(&line);
             }
             Status::Exited(e) => {
                 self.inferior.take();
@@ -110,7 +85,7 @@ impl Debugger {
     fn stopped_at_breakpoint(&mut self) -> Option<usize> {
         if let Some(inferior) = self.inferior.as_mut() {
             let regs = inferior.get_regs()?;
-            match inferior.get_breakpoint(&(regs.rip as usize)) {
+            match self.breakpoints.get_breakpoint(&(regs.rip as usize)) {
                 Some(_) => {
                     Some(regs.rip as usize)
                 }
@@ -122,11 +97,11 @@ impl Debugger {
     }
     fn continue_breakpoint(&mut self, addr: &usize) -> Result<StepStatus, nix::Error> {
         let inferior = self.inferior.as_mut().unwrap();
-        inferior.unset_breakpoint_t(addr)?;
+        self.breakpoints.unset_breakpoint_t(inferior, addr)?;
         inferior.ptrace_step()?;
         match inferior.wait(None)? {
             Status::Stopped(signal::SIGTRAP, _) => {
-                inferior.set_breakpoint_t(addr)?;
+                self.breakpoints.set_breakpoint_t(inferior, addr)?;
                 Ok(StepStatus::Ok)
             }
             Status::Exited(e) => {
@@ -144,27 +119,27 @@ impl Debugger {
         }
     }
     fn continue_normal(&mut self) -> Result<StepStatus, nix::Error> {
-            let inferior = self.inferior.as_mut().unwrap();
-            inferior.ptrace_step()?;
-            match inferior.wait(None)? {
-                Status::Stopped(signal::SIGTRAP, _) => {
-                    Ok(StepStatus::Ok)
-                }
-                Status::Exited(e) => {
-                    self.inferior.take();
-                    println!("Child exited (status {})", e);
-                    Ok(StepStatus::Exit)
-                }
-                Status::Stopped(s, _) => {
-                    println!("Child stopped (signal {})", s);
-                    Ok(StepStatus::Exit)
-                }
-                _ => {
-                    panic!("Something went wrong when excute code");
-                }
+        let inferior = self.inferior.as_mut().unwrap();
+        inferior.ptrace_step()?;
+        match inferior.wait(None)? {
+            Status::Stopped(signal::SIGTRAP, _) => {
+                Ok(StepStatus::Ok)
             }
-
+            Status::Exited(e) => {
+                self.inferior.take();
+                println!("Child exited (status {})", e);
+                Ok(StepStatus::Exit)
+            }
+            Status::Stopped(s, _) => {
+                println!("Child stopped (signal {})", s);
+                Ok(StepStatus::Exit)
+            }
+            _ => {
+                panic!("Something went wrong when excute code");
+            }
+        }
     }
+    
     fn single_step(&mut self) -> Result<StepStatus, nix::Error> {
         match self.stopped_at_breakpoint() {
             Some(addr) => {
@@ -175,20 +150,21 @@ impl Debugger {
                 self.continue_normal()
             }
         }
-        
     }
-
-    fn current_line(&mut self) -> Option<Line> {
-        match self.inferior.as_mut() {
-            None => {
-                None
-            }
-            Some(inferior) => {
-                let regs = inferior.get_regs()?;
-                let addr = regs.rip as usize;
-                self.debug_data.get_line_from_addr(addr)
+    
+    fn print_stop_line(stop_line: &Option<Line>) {
+        match stop_line {
+            None => {}
+            Some(line) => {
+                println!("Stopped at {}", line);
             }
         }
+    }
+    fn current_line(&mut self) -> Option<Line> {
+        let inferior = self.inferior.as_mut()?;
+        let regs = inferior.get_regs()?;
+        let addr = regs.rip as usize;
+        self.debug_data.get_line_from_addr(addr)
     }
     pub fn run(&mut self) {
         loop {
@@ -199,7 +175,7 @@ impl Debugger {
                         inferior.kill().unwrap();
                     }
 
-                    if let Some(inferior) = Inferior::new(&self.target, &args, &self.breakpoints) {
+                    if let Some(inferior) = Inferior::new(&self.target, &args, &mut self.breakpoints) {
                         // Create the inferior
                         self.inferior = Some(inferior);
                         // TODO (milestone 1): make the inferior run
@@ -241,16 +217,16 @@ impl Debugger {
                         continue;
                     };
 
-                    println!("Set breakpoint {} at {:#x}", self.breakpoints.len(), addr);
-
-                    self.breakpoints.push(addr);
-                    if let Some(inferior) = self.inferior.as_mut() {
-                        match inferior.set_breakpoint(&addr) {
-                            Ok(_) => {
+                    match self.breakpoints.set_breakpoint(&mut self.inferior, &addr) {
+                        Ok(success) => {
+                            if success {
+                                println!("Set breakpoint {} at {:#x}", self.breakpoints.get_count() - 1, addr);
+                            } else {
+                                println!("Breakpoint {:#x} have setted before", addr);
                             }
-                            Err(e) => {
-                                println!("{}", e);
-                            }
+                        }
+                        Err(e) => {
+                            println!("{}", e);
                         }
                     }
                 }
@@ -289,13 +265,7 @@ impl Debugger {
                         if continue_flag {
                             continue;
                         }
-                        match now_line {
-                            None => {
-                            }
-                            Some(line) => {
-                                println!("Stopped at {}", line);
-                            }
-                        }
+                        Self::print_stop_line(now_line);
                         break;
                     }
                 }
