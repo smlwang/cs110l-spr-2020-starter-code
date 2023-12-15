@@ -154,7 +154,9 @@ impl Debugger {
     
     fn print_stop_line(stop_line: &Option<Line>) {
         match stop_line {
-            None => {}
+            None => {
+                println!("Stopped at ???");
+            }
             Some(line) => {
                 println!("Stopped at {}", line);
             }
