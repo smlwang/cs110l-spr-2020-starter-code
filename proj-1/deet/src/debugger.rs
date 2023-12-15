@@ -83,18 +83,12 @@ impl Debugger {
     }
     
     fn stopped_at_breakpoint(&mut self) -> Option<usize> {
-        if let Some(inferior) = self.inferior.as_mut() {
-            let regs = inferior.get_regs()?;
-            match self.breakpoints.get(&(regs.rip as usize)) {
-                Some(_) => {
-                    Some(regs.rip as usize)
-                }
-                None => None,
-            }
-        } else {
-            None
-        }
+        let inferior = self.inferior.as_mut()?;
+        let regs = inferior.get_regs()?;
+        let _ = self.breakpoints.get(&(regs.rip as usize))?;
+        Some(regs.rip as usize)
     }
+
     fn continue_breakpoint(&mut self, addr: &usize) -> Result<StepStatus, nix::Error> {
         let inferior = self.inferior.as_mut().unwrap();
         self.breakpoints.unset_t(inferior, addr)?;
