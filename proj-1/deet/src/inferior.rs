@@ -69,7 +69,7 @@ impl Inferior {
         }
 
         let mut child = Inferior{child: cmd.spawn().ok()?};
-        breakpoints.init_breakpoint(&mut child).ok()?;
+        breakpoints.init(&mut child).ok()?;
         let inferior = match child.wait(None).ok()? {
             Status::Stopped(signal::SIGTRAP, _) => child,
             _ => return None,

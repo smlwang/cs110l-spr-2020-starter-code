@@ -41,7 +41,7 @@ impl BreakpointManager {
         BreakpointArgType::FuncName(raw_addr.to_string())
     }
     
-    pub fn init_breakpoint(&mut self, inferior: &mut Inferior) -> Result<(), nix::Error> {
+    pub fn init(&mut self, inferior: &mut Inferior) -> Result<(), nix::Error> {
         for (addr, breakpoint) in self.breakpoint_map.iter_mut() {
             let orig_byte = inferior.write_byte(*addr, 0xcc)?;
             *breakpoint = Some(Breakpoint{addr: *addr, orig_byte});
@@ -51,17 +51,19 @@ impl BreakpointManager {
     pub fn get_count(&self) -> usize {
         self.count
     }
-    pub fn set_breakpoint_t(&mut self, inferior: &mut Inferior, addr: &usize) -> Result<(), nix::Error> {
+    // set breakpoint after use unset_t
+    pub fn set_t(&mut self, inferior: &mut Inferior, addr: &usize) -> Result<(), nix::Error> {
         let _ = inferior.write_byte(*addr, 0xcc)?;
         Ok(())
     }
-    pub fn unset_breakpoint_t(&mut self, inferior: &mut Inferior, addr: &usize) -> Result<(), nix::Error>{
+    // temporarily unset breakpoint
+    pub fn unset_t(&mut self, inferior: &mut Inferior, addr: &usize) -> Result<(), nix::Error>{
         if let Some((_, Some(breakpoint))) = self.breakpoint_map.get_key_value(&addr) {
             let _ = inferior.write_byte(breakpoint.addr, breakpoint.orig_byte)?;
         }
         Ok(())
     }
-    pub fn unset_breakpoint(&mut self, inferior: &mut Option<Inferior>, addr: &usize) -> Result<(), nix::Error>{
+    pub fn unset(&mut self, inferior: &mut Option<Inferior>, addr: &usize) -> Result<(), nix::Error>{
         if let Some((_, Some(breakpoint))) = self.breakpoint_map.remove_entry(&addr) {
             match inferior.as_mut() {
                 None => {},
@@ -72,10 +74,10 @@ impl BreakpointManager {
         }
         Ok(())
     }
-    pub fn get_breakpoint(&mut self, addr: &usize) -> Option<Breakpoint> {
+    pub fn get(&mut self, addr: &usize) -> Option<Breakpoint> {
         self.breakpoint_map.get(addr)?.clone()
     }
-    pub fn set_breakpoint(&mut self, inferior: &mut Option<Inferior>, addr: &usize) -> Result<bool, nix::Error> {
+    pub fn set(&mut self, inferior: &mut Option<Inferior>, addr: &usize) -> Result<bool, nix::Error> {
         let breakpoint = match inferior.as_mut() {
             None => {
                 None
