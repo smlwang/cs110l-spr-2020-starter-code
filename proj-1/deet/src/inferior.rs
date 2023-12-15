@@ -5,6 +5,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::process::{Child, Command};
 use std::os::unix::process::CommandExt;
+use crate::breakpoint_manager::Breakpoint;
 use crate::breakpoint_manager::BreakpointManager;
 use crate::dwarf_data::{DwarfData};
 use std::mem::size_of;
@@ -69,13 +70,20 @@ impl Inferior {
         }
 
         let mut child = Inferior{child: cmd.spawn().ok()?};
-        breakpoints.init(&mut child).ok()?;
+        child.init_breakpoints(breakpoints).ok()?;
         let inferior = match child.wait(None).ok()? {
             Status::Stopped(signal::SIGTRAP, _) => child,
             _ => return None,
         };
         
         Some(inferior)
+    }
+    fn init_breakpoints(&mut self, breakpoints: &mut BreakpointManager) -> Result<(), nix::Error> {
+        for (addr, breakpoint) in breakpoints.iter_mut() {
+            let orig_byte = self.write_byte(*addr, 0xcc)?;
+            *breakpoint = Some(Breakpoint::new(*addr, orig_byte));
+        }
+        Ok(())
     }
     pub fn get_regs(&self) -> Option<libc::user_regs_struct> {
         Some(ptrace::getregs(self.pid()).ok()?)

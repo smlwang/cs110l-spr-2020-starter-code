@@ -11,6 +11,11 @@ pub struct Breakpoint {
     addr: usize,
     orig_byte: u8,
 }
+impl Breakpoint {
+    pub fn new(addr: usize, orig_byte: u8) -> Breakpoint {
+        Breakpoint { addr, orig_byte }
+    }
+}
 pub enum BreakpointArgType {
     Line(usize),
     FuncName(String),
@@ -41,12 +46,8 @@ impl BreakpointManager {
         BreakpointArgType::FuncName(raw_addr.to_string())
     }
     
-    pub fn init(&mut self, inferior: &mut Inferior) -> Result<(), nix::Error> {
-        for (addr, breakpoint) in self.breakpoint_map.iter_mut() {
-            let orig_byte = inferior.write_byte(*addr, 0xcc)?;
-            *breakpoint = Some(Breakpoint{addr: *addr, orig_byte});
-        }
-        Ok(())
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, usize, Option<Breakpoint>>{
+        self.breakpoint_map.iter_mut()
     }
     pub fn get_count(&self) -> usize {
         self.count
