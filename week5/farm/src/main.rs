@@ -13,11 +13,14 @@ fn is_prime(num: u32) -> bool {
     if num <= 1 {
         return false;
     }
-    for factor in 2..((num as f64).sqrt().floor() as u32) {
+    let mut factor = 2u32;
+    while factor as u64 * factor as u64 <= num as u64 {
         if num % factor == 0 {
             return false;
         }
+        factor += 1
     }
+
     true
 }
 
@@ -36,11 +39,16 @@ fn factor_number(num: u32) {
 
     let mut factors = Vec::new();
     let mut curr_num = num;
-    for factor in 2..num {
+    let mut factor = 2;
+    while factor as u64 * factor as u64 <= curr_num as u64 {
         while curr_num % factor == 0 {
             factors.push(factor);
             curr_num /= factor;
         }
+        factor += 1;
+    }
+    if curr_num > 1 {
+        factors.push(curr_num);
     }
     factors.sort();
     let factors_str = factors
@@ -48,6 +56,7 @@ fn factor_number(num: u32) {
         .map(|f| f.to_string())
         .collect::<Vec<String>>()
         .join(" * ");
+
     println!("{} = {} [time: {:?}]", num, factors_str, start.elapsed());
 }
 
@@ -72,11 +81,18 @@ fn main() {
     let start = Instant::now();
 
     // TODO: call get_input_numbers() and store a queue of numbers to factor
-
+    let mut input_numbers = get_input_numbers();
     // TODO: spawn `num_threads` threads, each of which pops numbers off the queue and calls
     // factor_number() until the queue is empty
-
+    let mut num_threads = vec![];
+    while let Some(number) = input_numbers.pop_back() {
+        num_threads.push(thread::spawn(move || {
+            factor_number(number)
+        }));
+    }
     // TODO: join all the threads you created
-
+    for handle in num_threads {
+        handle.join().expect("some thing wrong with thread");
+    }
     println!("Total execution time: {:?}", start.elapsed());
 }
