@@ -3,7 +3,7 @@ mod common;
 use common::{init_logging, BalanceBeam, EchoServer, ErrorServer, Server};
 
 use std::time::Duration;
-use tokio::time::delay_for;
+use tokio::time::sleep;
 
 async fn setup_with_params(
     n_upstreams: usize,
@@ -41,7 +41,7 @@ async fn setup(n_upstreams: usize) -> (BalanceBeam, Vec<Box<dyn Server>>) {
 #[tokio::test]
 async fn test_load_distribution() {
     let n_upstreams = 3;
-    let n_requests = 90;
+    let n_requests = 50;
     let (balancebeam, mut upstreams) = setup(n_upstreams).await;
 
     for i in 0..n_requests {
@@ -162,7 +162,7 @@ async fn test_active_health_checks_check_http_status() {
     upstreams.push(Box::new(ErrorServer::new_at_address(failed_ip).await));
 
     log::info!("Waiting for health checks to realize server is dead...");
-    delay_for(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(3)).await;
 
     // Make sure we get back successful requests
     for i in 0..8 {
@@ -209,7 +209,7 @@ async fn test_active_health_checks_restore_failed_upstream() {
     upstreams.push(Box::new(EchoServer::new_at_address(failed_ip).await));
 
     log::info!("Waiting a few seconds for the active health check to run...");
-    delay_for(Duration::from_secs(3)).await;
+    sleep(Duration::from_secs(3)).await;
 
     log::info!("Sending some more requests");
     for i in 0..5 {

@@ -1,41 +1,35 @@
 mod request;
 mod response;
 
-use clap::Clap;
+use threadpool::ThreadPool;
+use crossbeam::channel;
+use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::net::{TcpListener, TcpStream};
+use std::{net::{TcpListener, TcpStream}, rc::Rc, sync::Arc, thread};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
-#[derive(Clap, Debug)]
+#[derive(Parser, Debug)]
 #[clap(about = "Fun with load balancing")]
 struct CmdOptions {
-    #[clap(
-        short,
-        long,
-        about = "IP/port to bind to",
-        default_value = "0.0.0.0:1100"
-    )]
+    /// IP/port to bind to
+    #[arg(short, long, default_value_t = String::from("127.0.0.1:8080"))]
     bind: String,
-    #[clap(short, long, about = "Upstream host to forward requests to")]
+
+    /// Upstream host to forward requests to
+    #[arg(short, long)]
     upstream: Vec<String>,
-    #[clap(
-        long,
-        about = "Perform active health checks on this interval (in seconds)",
-        default_value = "10"
-    )]
+    
+    /// Perform active heath checks on this interval (in seconds)
+    #[arg(long, default_value_t = 10)]
     active_health_check_interval: usize,
-    #[clap(
-    long,
-    about = "Path to send request to for active health checks",
-    default_value = "/"
-    )]
+
+    /// Path to send request to for active health checks
+    #[arg(long, default_value_t = String::from("/"))]
     active_health_check_path: String,
-    #[clap(
-        long,
-        about = "Maximum number of requests to accept per IP per minute (0 = unlimited)",
-        default_value = "0"
-    )]
+
+    /// Maximum number of requests to accept per IP per minute (0 = unlimited)
+    #[arg(long, default_value_t = 0)]
     max_requests_per_minute: usize,
 }
 
@@ -84,15 +78,26 @@ fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = ProxyState {
+    let state = Arc::new(ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-    };
+    });
+    
+    // for stream in listener.incoming() {
+    //     log::info!("listener incoming!");
+    //     if let Ok(stream) = stream {
+    //         let state_r = state.clone();
+    //         // Handle the connection!
+    //         thread::spawn(move || {
+    //             handle_connection(stream, state_r.as_ref());
+    //         });
+    //     }
+    // }
     for stream in listener.incoming() {
+        log::info!("listener incoming!");
         if let Ok(stream) = stream {
-            // Handle the connection!
             handle_connection(stream, &state);
         }
     }
@@ -100,7 +105,7 @@ fn main() {
 
 fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+    let upstream_idx = rng.gen_range(0..state.upstream_addresses.len());
     let upstream_ip = &state.upstream_addresses[upstream_idx];
     TcpStream::connect(upstream_ip).or_else(|err| {
         log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
@@ -132,9 +137,10 @@ fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
         }
     };
     let upstream_ip = client_conn.peer_addr().unwrap().ip().to_string();
-
     // The client may now send us one or more requests. Keep trying to read requests until the
     // client hangs up or we get an error.
+    // 
+    // read request from cilent -> send request to server -> recieve response from server -> send response to cilent
     loop {
         // Read a request from the client
         let mut request = match request::read_from_stream(&mut client_conn) {
