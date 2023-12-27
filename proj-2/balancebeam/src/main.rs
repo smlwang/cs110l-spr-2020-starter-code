@@ -1,14 +1,14 @@
 mod request;
 mod response;
 
+use std::net::IpAddr;
+use std::time::Duration;
 use clap::Parser;
-use rand::{Rng, SeedableRng};
+// use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock};
-use tokio::time::Interval;
-use std::{io, usize};
+use tokio::sync::{Mutex};
 use std::{sync::Arc};
-use std::collections::{VecDeque};
+use std::collections::{HashMap, VecDeque, BTreeSet};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -54,8 +54,42 @@ struct ProxyState {
     upstream_addresses: Vec<String>,
     /// Flag of whether address is avaliable
     upstream_availability: Vec<bool>,
-    // /// Address which is unavaliable
-    // upstream_unavaliable: VecDeque<usize>,
+    // Ordered set of avaliable upstream about number of link
+    upstream_ord_set: BTreeSet<(usize, usize)>,
+}
+
+struct IpLimitController {
+    max_requests_per_minute: usize,
+    window: VecDeque<(IpAddr, Duration)>,
+    ip_counter: HashMap<IpAddr, usize>,
+    timer: tokio::time::Instant,
+}
+
+impl IpLimitController {
+    fn try_add(&mut self, ip: IpAddr) -> bool {
+        if self.max_requests_per_minute == 0 {
+            return true;
+        }
+        let right = self.timer.elapsed();
+        let minute = Duration::from_secs(60);
+        let left = right.saturating_sub(minute);
+        while !self.window.is_empty() {
+            let (ip, time) = self.window.pop_front().unwrap();
+            if time < left {
+                self.ip_counter.entry(ip).and_modify(|counter| *counter -= 1);
+            } else {
+                self.window.push_front((ip, time));
+                break;
+            }
+        }
+        let counter = self.ip_counter.entry(ip).or_insert(0);
+        if *counter >= self.max_requests_per_minute {
+            return false;
+        }
+        *counter += 1;
+        self.window.push_back((ip, right));
+        true
+    }
 }
 
 #[tokio::main]
@@ -86,25 +120,40 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     let address_count = options.upstream.len();
-    // Handle incoming connections
-    let state = Arc::new(RwLock::new(ProxyState {
+    
+    let mut state_raw = ProxyState {
         upstream_availability: vec![true; address_count],
         upstream_addresses: options.upstream,
     // upstream_unavaliable: VecDeque::with_capacity(address_count),
+        upstream_ord_set: BTreeSet::new(),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+    };
+    for i in 0..address_count {
+        state_raw.upstream_ord_set.insert((0, i));
+    }
+
+    let state = Arc::new(Mutex::new(state_raw));
+
+    // thread for health check
+    // tokio::spawn(health_check_task(state.clone(), 
+    //     tokio::time::Duration::from_millis(options.active_health_check_interval as u64)));
+    
+    let ip_limit_controller = Arc::new(Mutex::new(IpLimitController {
+        max_requests_per_minute: options.max_requests_per_minute,
+        ip_counter: HashMap::new(),
+        window: VecDeque::new(),
+        timer: tokio::time::Instant::now(),
     }));
-    // let state_r = state.clone();
-    // let helth_check_handle = 
-    tokio::spawn(health_check_task(state.clone(), 
-        tokio::time::Duration::from_millis(options.active_health_check_interval as u64)));
+
     loop {
         if let Ok((client_conn, _)) = listener.accept().await {
             log::info!("listener incoming!");
             let state_r = state.clone();
+            let ip_limit_controller_r = ip_limit_controller.clone();
             tokio::task::spawn(async move {
-                handle_connection(client_conn, state_r).await;
+                handle_connection(client_conn, state_r, ip_limit_controller_r).await;
             });
         } else {
             log::info!("listener incoming!");
@@ -113,103 +162,87 @@ async fn main() {
 
 }
 
-async fn health_check_task(state: Arc<RwLock<ProxyState>>, interval: tokio::time::Duration) {
+async fn health_check_task(state: Arc<Mutex<ProxyState>>, interval: tokio::time::Duration) {
     let mut interval = tokio::time::interval(interval);
     loop {
         interval.tick().await;
         // do health check
         log::info!("Health check!");
-        let mut state_w = state.write().await;
-        for idx in 0..state_w.upstream_addresses.len() {
-
-            let upstream = &state_w.upstream_addresses[idx];
+        let mut state_b = state.lock().await;
+        for idx in 0..state_b.upstream_addresses.len() {
+            let upstream = &state_b.upstream_addresses[idx];
             let mut conn = match TcpStream::connect(upstream).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     log::error!("Health check | Connect to {} failed: {}", upstream, e);
-                    state_w.upstream_availability[idx] = false;
+                    state_b.upstream_availability[idx] = false;
                     continue;
                 }
             };
             let request = 
                 http::Request::builder()
                             .method(http::Method::GET)
-                            .uri(&state_w.active_health_check_path)
+                            .uri(&state_b.active_health_check_path)
                             .header("Host", upstream)
-                            .body(Vec::<u8>::new())
+                            .body(Vec::new())
                             .unwrap();
             if let Err(error) = request::write_to_stream(&request, &mut conn).await {
                 log::error!("Health check | Failed to send request to upstream {}: {}", upstream, error);
-                state_w.upstream_availability[idx] = false;
+                state_b.upstream_availability[idx] = false;
                 continue;
             }
             let response = match response::read_from_stream(&mut conn, request.method()).await {
                 Ok(response) => response,
                 Err(error) => {
                     log::error!("Health check | Error reading response from server: {:?}", error);
-                    state_w.upstream_availability[idx] = false;
+                    state_b.upstream_availability[idx] = false;
                     continue;
                 }
             };
             match response.status() {
                 http::StatusCode::OK => {
-                    state_w.upstream_availability[idx] = true;
+                    if state_b.upstream_availability[idx] == false {
+                        log::info!("Health check | Upstream {} is available", upstream);
+                        state_b.upstream_ord_set.insert((0, idx));
+                    }
+                    state_b.upstream_availability[idx] = true;
                 }
                 _ => {
-                    state_w.upstream_availability[idx] = false;
+                    if state_b.upstream_availability[idx] == true {
+                        log::info!("Health check | Upstream {} is not available", upstream);
+                    }
+                    state_b.upstream_availability[idx] = false;
                 }
             }
         }
     }
 }
 
-async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, tokio::io::Error> {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let mut dead_upstreams = vec![];
+async fn connect_to_upstream(state: Arc<Mutex<ProxyState>>) -> Result<TcpStream, tokio::io::Error> {
     let mut stream_select: Option<TcpStream> = None;
     {
-        let state_r = state.read().await;
-        let len = state_r.upstream_addresses.len();
-        // if state_r.upstream_unavaliable.len() == len {
-        //     return Err(tokio::io::Error::new(
-        //         tokio::io::ErrorKind::Other,
-        //         "All upstreams are unavaliable",
-        //     ));
-        // }
-        let mut upstream_idx = rng.gen_range(0..len);
+        let mut state_b = state.lock().await;
 
-        // O(n) implement should be enough
-        for _i in 0..len {
-            if state_r.upstream_availability[upstream_idx] == true {
-                let upstream_ip = &state_r.upstream_addresses[upstream_idx];
-                match TcpStream::connect(upstream_ip).await {
-                    Ok(stream) => {
-                        stream_select = Some(stream);
-                        break;
-                    }
-                    Err(err) => {
-                        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-                        dead_upstreams.push(upstream_idx);
-                    }
+        while let Some((counter, upstream_idx)) = state_b.upstream_ord_set.pop_first() {
+            let upstream_ip = &state_b.upstream_addresses[upstream_idx];
+            if state_b.upstream_availability[upstream_idx] == false {
+                continue;
+            }
+            match TcpStream::connect(upstream_ip).await {
+                Ok(stream) => {
+                    stream_select = Some(stream);
+                    state_b.upstream_ord_set.insert((counter + 1, upstream_idx));
+                    break;
+                }
+                Err(err) => {
+                    log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
                 }
             }
-            upstream_idx = (upstream_idx + 1) % len;
-        }
-    }
-    if dead_upstreams.len() > 0 {
-        // writer preferring, don't worry hungry.
-        let mut state_w = state.write().await;
-        for dead_upstream in dead_upstreams {
-            // if state_w.upstream_availability[dead_upstream] == false {
-            //     continue;
-            // }
-            // state_w.upstream_unavaliable.push_back(dead_upstream);
-            state_w.upstream_availability[dead_upstream] = false;
         }
     }
     match stream_select {
         None => {
-            Err(io::Error::new(io::ErrorKind::Other, "No available upstreams"))
+            Err(tokio::io::Error::new(tokio::io::ErrorKind::Other, "No available upstreams"))
         }
         Some(stream) => {
             Ok(stream)
@@ -227,8 +260,16 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: Arc<RwLock<ProxyState>>) {
-    let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
+async fn handle_connection(mut client_conn: TcpStream, state: Arc<Mutex<ProxyState>>, ip_limit: Arc<Mutex<IpLimitController>>) {
+    let client_ip_raw = client_conn.peer_addr().unwrap().ip();
+    let client_ip = client_ip_raw.to_string();
+    if !ip_limit.lock().await.try_add(client_ip_raw) {
+        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+        send_response(&mut client_conn, &response).await;
+        log::warn!("Connection from {} dropped due to too many connections", client_ip);
+        return;
+    }
+    
     log::info!("Connection received from {}", client_ip);
 
     // Open a connection to a random destination server
