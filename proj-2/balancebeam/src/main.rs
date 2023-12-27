@@ -137,8 +137,8 @@ async fn main() {
     let state = Arc::new(Mutex::new(state_raw));
 
     // thread for health check
-    // tokio::spawn(health_check_task(state.clone(), 
-    //     tokio::time::Duration::from_millis(options.active_health_check_interval as u64)));
+    tokio::spawn(health_check_task(state.clone(), 
+        tokio::time::Duration::from_secs(options.active_health_check_interval as u64)));
     
     let ip_limit_controller = Arc::new(Mutex::new(IpLimitController {
         max_requests_per_minute: options.max_requests_per_minute,
@@ -164,6 +164,8 @@ async fn main() {
 
 async fn health_check_task(state: Arc<Mutex<ProxyState>>, interval: tokio::time::Duration) {
     let mut interval = tokio::time::interval(interval);
+    // first tick do nothing, order to pass all tests
+    interval.tick().await;
     loop {
         interval.tick().await;
         // do health check
