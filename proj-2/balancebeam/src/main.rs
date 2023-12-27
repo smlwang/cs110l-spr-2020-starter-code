@@ -5,8 +5,10 @@ use clap::Parser;
 use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock};
-use std::io;
-use std::{sync::Arc, thread};
+use tokio::time::Interval;
+use std::{io, usize};
+use std::{sync::Arc};
+use std::collections::{VecDeque};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -52,6 +54,8 @@ struct ProxyState {
     upstream_addresses: Vec<String>,
     /// Flag of whether address is avaliable
     upstream_availability: Vec<bool>,
+    // /// Address which is unavaliable
+    // upstream_unavaliable: VecDeque<usize>,
 }
 
 #[tokio::main]
@@ -86,25 +90,17 @@ async fn main() {
     let state = Arc::new(RwLock::new(ProxyState {
         upstream_availability: vec![true; address_count],
         upstream_addresses: options.upstream,
+    // upstream_unavaliable: VecDeque::with_capacity(address_count),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     }));
-    
-    // for stream in listener.incoming() {
-    //     log::info!("listener incoming!");
-    //     if let Ok(stream) = stream {
-    //         let state_r = state.clone();
-    //         // Handle the connection!
-    //         thread::spawn(move || {
-    //             handle_connection(stream, state_r.as_ref());
-    //         });
-    //     }
-    // }
-    
+    // let state_r = state.clone();
+    // let helth_check_handle = 
+    tokio::spawn(health_check_task(state.clone(), 
+        tokio::time::Duration::from_millis(options.active_health_check_interval as u64)));
     loop {
         if let Ok((client_conn, _)) = listener.accept().await {
-
             log::info!("listener incoming!");
             let state_r = state.clone();
             tokio::task::spawn(async move {
@@ -117,6 +113,56 @@ async fn main() {
 
 }
 
+async fn health_check_task(state: Arc<RwLock<ProxyState>>, interval: tokio::time::Duration) {
+    let mut interval = tokio::time::interval(interval);
+    loop {
+        interval.tick().await;
+        // do health check
+        log::info!("Health check!");
+        let mut state_w = state.write().await;
+        for idx in 0..state_w.upstream_addresses.len() {
+
+            let upstream = &state_w.upstream_addresses[idx];
+            let mut conn = match TcpStream::connect(upstream).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("Health check | Connect to {} failed: {}", upstream, e);
+                    state_w.upstream_availability[idx] = false;
+                    continue;
+                }
+            };
+            let request = 
+                http::Request::builder()
+                            .method(http::Method::GET)
+                            .uri(&state_w.active_health_check_path)
+                            .header("Host", upstream)
+                            .body(Vec::<u8>::new())
+                            .unwrap();
+            if let Err(error) = request::write_to_stream(&request, &mut conn).await {
+                log::error!("Health check | Failed to send request to upstream {}: {}", upstream, error);
+                state_w.upstream_availability[idx] = false;
+                continue;
+            }
+            let response = match response::read_from_stream(&mut conn, request.method()).await {
+                Ok(response) => response,
+                Err(error) => {
+                    log::error!("Health check | Error reading response from server: {:?}", error);
+                    state_w.upstream_availability[idx] = false;
+                    continue;
+                }
+            };
+            match response.status() {
+                http::StatusCode::OK => {
+                    state_w.upstream_availability[idx] = true;
+                }
+                _ => {
+                    state_w.upstream_availability[idx] = false;
+                }
+            }
+        }
+    }
+}
+
 async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream, tokio::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut dead_upstreams = vec![];
@@ -124,6 +170,12 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
     {
         let state_r = state.read().await;
         let len = state_r.upstream_addresses.len();
+        // if state_r.upstream_unavaliable.len() == len {
+        //     return Err(tokio::io::Error::new(
+        //         tokio::io::ErrorKind::Other,
+        //         "All upstreams are unavaliable",
+        //     ));
+        // }
         let mut upstream_idx = rng.gen_range(0..len);
 
         // O(n) implement should be enough
@@ -148,6 +200,10 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
         // writer preferring, don't worry hungry.
         let mut state_w = state.write().await;
         for dead_upstream in dead_upstreams {
+            // if state_w.upstream_availability[dead_upstream] == false {
+            //     continue;
+            // }
+            // state_w.upstream_unavaliable.push_back(dead_upstream);
             state_w.upstream_availability[dead_upstream] = false;
         }
     }
@@ -159,7 +215,6 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
             Ok(stream)
         }
     }
-    // TODO: implement failover (milestone 3)
     
 }
 
