@@ -265,12 +265,6 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
 async fn handle_connection(mut client_conn: TcpStream, state: Arc<Mutex<ProxyState>>, ip_limit: Arc<Mutex<IpLimitController>>) {
     let client_ip_raw = client_conn.peer_addr().unwrap().ip();
     let client_ip = client_ip_raw.to_string();
-    if !ip_limit.lock().await.try_add(client_ip_raw) {
-        let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
-        send_response(&mut client_conn, &response).await;
-        log::warn!("Connection from {} dropped due to too many connections", client_ip);
-        return;
-    }
     
     log::info!("Connection received from {}", client_ip);
 
@@ -316,6 +310,12 @@ async fn handle_connection(mut client_conn: TcpStream, state: Arc<Mutex<ProxySta
                 continue;
             }
         };
+        if !ip_limit.lock().await.try_add(client_ip_raw) {
+            let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+            send_response(&mut client_conn, &response).await;
+            log::warn!("Connection from {} dropped due to too many connections", client_ip);
+            continue;
+        }
         log::info!(
             "{} -> {}: {}",
             client_ip,
