@@ -126,24 +126,25 @@ async fn connect_to_upstream(state: Arc<RwLock<ProxyState>>) -> Result<TcpStream
         let len = state_r.upstream_addresses.len();
         let mut upstream_idx = rng.gen_range(0..len);
 
-        // the number of upstreams usually less than 1e3, O(n^2) should be enough
-        for i in 0..len {
+        // O(n) implement should be enough
+        for _i in 0..len {
             if state_r.upstream_availability[upstream_idx] == true {
                 let upstream_ip = &state_r.upstream_addresses[upstream_idx];
                 match TcpStream::connect(upstream_ip).await {
                     Ok(stream) => {
                         stream_select = Some(stream);
+                        break;
                     }
                     Err(err) => {
                         log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-                        dead_upstreams.push(i);
+                        dead_upstreams.push(upstream_idx);
                     }
                 }
             }
             upstream_idx = (upstream_idx + 1) % len;
         }
     }
-    {
+    if dead_upstreams.len() > 0 {
         // writer preferring, don't worry hungry.
         let mut state_w = state.write().await;
         for dead_upstream in dead_upstreams {
